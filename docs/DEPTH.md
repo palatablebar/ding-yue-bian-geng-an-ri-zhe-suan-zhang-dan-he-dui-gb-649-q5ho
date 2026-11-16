@@ -1,6 +1,6 @@
 # 深度登记 subbill 订阅变更按日折算与账单核对
 
-- 规模：中型（7 个功能模块，74–80 个文件，测试 ≥53）
+- 规模：中型（8 个功能模块，测试 ≥100）
 - 核心规则：期间 `[start, end)` 的实际天数做分母，变更切段后「预缴整期 − 未用额度抵扣 + 新价补收」，尾差按最大余额法分到 0.01
 - 使用者与工作流：SaaS 计费运营每月把订阅与变更两份导出文件拖进系统，先看隔离区确认哪些行不可用，再逐张核账单，最后导出账单与运行清单归档
 
@@ -15,6 +15,7 @@
 | M5 变更抵扣 | 看变更序列、被替代关系与抵扣行 | GET /api/changes | `app/modules/m5_changes/segments.py` `app/modules/m5_changes/credit.py` | `tests/test_changes.py` `tests/test_credit.py` |
 | M6 账单对账 | 出账、点行看明细、核对四本账 | GET /api/invoices | `app/modules/m6_invoices/invoice.py` `app/modules/m6_invoices/reconcile.py` | `tests/test_invoices.py` `tests/test_reconcile.py` |
 | M7 导出 | 导出账单 CSV、分段 CSV、运行清单 JSON | GET /api/export/invoices.csv | `app/modules/m7_export/csv_out.py` `app/modules/m7_export/manifest_out.py` | `tests/test_export.py` `tests/test_export_manifest.py` |
+| M8 账单修订 | 登记发账后的变更更正、发布修订版、看调整单与版本快照 | POST /api/revisions/corrections、POST /api/revisions/publish | `app/modules/m8_revisions/service.py` `app/modules/m8_revisions/revision.py` `app/modules/m8_revisions/reconcile.py` | `tests/test_revision_compute.py` `tests/test_revision_service.py` `tests/test_revisions_api.py` |
 
 端到端与不变量分别由 `tests/test_e2e.py`、`tests/test_invariants.py` 固定。
 
@@ -33,6 +34,11 @@
 | TRAP-23 | 期间端点归属与相邻段接缝 | 两端都算，重复计一天 | 半开 `[start, end)`，相邻段 end 等于下段 start | `app/modules/m5_changes/segments.py`、`app/modules/m2_calendar/days.py` | `tests/test_calendar.py::test_adjacent_segments_cover_period`、`tests/test_changes.py::test_change_on_period_start_zero_day_segment` |
 | TRAP-24 | 抵扣行、补收行各自四舍五入 | 分完合计比总额多 1 分 | 最大余额法把差额补到小数余额最大的分量，负数抵扣同样成立 | `app/modules/m4_proration/rounding.py` | `tests/test_rounding.py::test_largest_remainder_keeps_total`、`tests/test_credit.py::test_component_cents_sum_to_invoice` |
 | TRAP-25 | 同一订阅同一时刻两条变更 | 取到哪条看文件顺序，重跑结果会变 | 同日只让 (生效时刻, 变更号) 最小的一条生效，其余标 `R_CHANGE_OVERLAP` 并记替代关系 | `app/modules/m3_quality/service.py`、`app/modules/m5_changes/segments.py` | `tests/test_changes.py::test_same_instant_overlap_deterministic`、`tests/test_invariants.py::test_change_order_independence` |
+| TRAP-26 | 账单已发给客户后才收到账期内更正 | 直接 UPDATE 原账单，已发金额与留档依据被悄悄改写，复核无据可查 | 原账单整版快照进 `invoice_versions`（含全字段哈希），修订只产出版本与调整单，旧版逐字可取 | `app/store.py`、`app/modules/m8_revisions/service.py` | `tests/test_revision_service.py::test_publish_keeps_original_version_snapshot` |
+| TRAP-27 | 同一条更正被补发或重试 | 重复入账，客户被退/补两次 | 更正号唯一做幂等键，已发布再提交返回同一 `revision_no`，不新增调整单与快照 | `app/modules/m8_revisions/service.py` | `tests/test_revision_service.py::test_idempotent_retry_does_not_duplicate_adjustment`、`tests/test_revisions_api.py::test_retry_same_correction_is_idempotent` |
+| TRAP-28 | 修订发布到一半进程失败 | 派生表删了没重建，账单/对账停在半成品状态 | 快照+整版替换+调整单在一个 SQLite 事务里，异常整体回滚恢复完整旧版，仅更正单标 `failed` 留痕可重试 | `app/store.py::Store.publish_revision` | `tests/test_revision_service.py::test_publish_failure_rolls_back_complete_old_version` |
+| TRAP-29 | 第二次修订从原始变更重算 | 第一次更正被冲掉，调整链断裂，金额对不上客户已收通知 | 合并后的变更序列随发布事务落库，后续修订在上一版事实之上继续并入，调整单按版本链接 before/after | `app/modules/m8_revisions/revision.py`、`app/store.py` | `tests/test_revision_service.py::test_second_revision_chains_versions` |
+| TRAP-30 | 修订后账单、对账、导出各算各的 | 页面一个数、CSV 一个数、清单又一个数 | 五本账（新增修订账 `Σ调整=当前−原账单`）与账单/调整单/清单/CSV 全部读同一批表，发布事务内一致替换 | `app/modules/m8_revisions/reconcile.py`、`app/modules/m8_revisions/csv_out.py` | `tests/test_revisions_api.py::test_bill_export_and_pages_stay_consistent` |
 
 ## 对账规则
 
@@ -40,6 +46,7 @@
 - 期间天数账：账单期间天数 = 计费天数 + 免费/暂停天数
 - 金额账：分段合计（分） = 抵扣合计（分） + 账单额合计（分）
 - 出账账：账单行数 = 有分段的账单数
+- 修订账（M8，发布修订后出现）：Σ调整差额（分） = Σ当前账单额 − Σ原账单额；逐张调整单满足 原额 + 差额 = 新额
 - 恒等式：预缴整期 − Σ抵扣 + Σ补收 = Σ(各段费率 × 段天数)
 
 ## 已知不覆盖

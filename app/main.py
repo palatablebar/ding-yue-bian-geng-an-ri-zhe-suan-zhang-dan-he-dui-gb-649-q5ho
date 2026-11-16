@@ -23,11 +23,13 @@ from .modules.m5_changes import service as change_service
 from .modules.m6_invoices import handler as m6_handler
 from .modules.m6_invoices import service as invoice_service
 from .modules.m7_export import handler as m7_handler
+from .modules.m8_revisions import handler as m8_handler
 from .store import Store
 
 MODULES = (m1_handler, m2_handler, m3_handler, m4_handler, m5_handler, m6_handler,
-           m7_handler)
-PAGE_PATHS = ("/", "/subscriptions", "/calendar", "/proration", "/changes", "/invoices")
+           m7_handler, m8_handler)
+PAGE_PATHS = ("/", "/subscriptions", "/calendar", "/proration", "/changes",
+              "/invoices", "/revisions")
 
 
 def _tables(settings, run: dict | None) -> tuple[object, object] | tuple[None, None]:
@@ -132,12 +134,37 @@ def create_app(settings: config.Settings | None = None) -> FastAPI:
 
     @app.get("/invoices")
     def page_invoices(request: Request):
+        from .modules.m8_revisions import service as revision_service
+
         store = app.state.store
         run = app.state.ctx.current_run(request.query_params.get("run_id"))
         data = invoice_service.overview(store, run["run_id"]) if run else {
             "invoices": [], "ledgers": [], "totals": {}}
+        revision = (revision_service.overview(store, run["run_id"]) if run else
+                    {"current_revision": 0, "revision_totals": {}})
         return _render(request, "invoices.html", "invoices", invoices=data["invoices"],
-                       ledgers=data["ledgers"], totals=data["totals"])
+                       ledgers=data["ledgers"], totals=data["totals"],
+                       current_revision=revision["current_revision"],
+                       revision_totals=revision["revision_totals"])
+
+    @app.get("/revisions")
+    def page_revisions(request: Request):
+        from .modules.m8_revisions import service as revision_service
+
+        store = app.state.store
+        run = app.state.ctx.current_run(request.query_params.get("run_id"))
+        data = revision_service.overview(store, run["run_id"]) if run else {
+            "current_revision": 0, "corrections": [], "adjustments": [],
+            "revision_totals": {}, "versions": []}
+        return _render(
+            request, "revisions.html", "revisions",
+            corrections=revision_service.correction_rows(
+                store, run["run_id"]) if run else [],
+            adjustments=revision_service.adjustment_rows(
+                store, run["run_id"]) if run else [],
+            revision_totals=data["revision_totals"],
+            current_revision=data["current_revision"],
+            versions=data["versions"])
 
     def _head_ok() -> Response:
         return Response(status_code=200, media_type="text/html; charset=utf-8")

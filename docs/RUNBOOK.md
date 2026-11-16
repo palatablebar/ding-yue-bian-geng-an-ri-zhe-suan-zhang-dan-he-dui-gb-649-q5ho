@@ -62,6 +62,43 @@ docker compose down -v          # 删掉命名卷，下次启动会重建空库
 docker compose up -d --build
 ```
 
+## 账单修订（发账后收到变更更正）
+
+原账单不覆盖，按「登记更正 → 发布修订 → 调整单/导出」两步走，全过程留痕：
+
+```bash
+# 1 登记更正单（可多条；correction_id 是幂等键，重发不重复入账）
+curl -s -X POST http://127.0.0.1:18208/api/revisions/corrections \
+  -H 'Content-Type: application/json' -d '{
+    "corrections": [{
+      "correction_id": "COR-0001",
+      "sub_id": "SUB-1003",
+      "effective": "2026-02-15T00:00:00+08:00",
+      "kind": "降配",
+      "new_plan": "基础版",
+      "new_price": "300.00",
+      "reason": "客户合同更正，2月15日起降配",
+      "source": "ticket-42"
+    }]}'
+
+# 2 发布修订版（不传 correction_ids 则发布所有未发布更正）
+curl -s -X POST http://127.0.0.1:18208/api/revisions/publish \
+  -H 'Content-Type: application/json' -d '{"correction_ids": ["COR-0001"]}'
+
+# 3 复核：更正单、调整单、版本快照
+curl -s http://127.0.0.1:18208/api/revisions | head -c 600
+curl -s -o /tmp/adjustments.csv http://127.0.0.1:18208/api/revisions/adjustments.csv
+```
+
+复核要点：
+
+- 账单页顶部出现「修订提示 R<n>」，对账多一本「修订账」，五本账全平才算发布成功。
+- 调整单逐张满足 `原账单额 + 差额 = 修订后金额`；负数差额是应退，正数是应补。
+- `/revisions` 页可看每张账单的历史版本快照（含全字段哈希），原账单金额永久可查。
+- 补发或重试同一条更正：返回 `idempotent=true` 且 `revision_no` 不变，不产生第二笔调整。
+- 发布过程失败：事务整体回滚，账单/分段/对账恢复到发布前；更正单状态变 `failed` 并记录原因，修复后用同一 `correction_id` 重新发布即可。
+- 校验错误：账期外 `E_CORRECTION_OUT_OF_PERIOD`、未知订阅 `E_CORRECTION_UNKNOWN_SUB`、坏类型/价格 `E_CORRECTION_KIND/PRICE`、同批重复 `E_CORRECTION_DUP`、混用已发布与未发布 `E_CORRECTION_MIXED`。
+
 ## 排错
 
 | 现象 | 检查 |

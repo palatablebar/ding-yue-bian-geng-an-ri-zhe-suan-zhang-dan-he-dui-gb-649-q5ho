@@ -170,6 +170,68 @@ CREATE TABLE IF NOT EXISTS manifests (
     run_id TEXT PRIMARY KEY,
     json TEXT NOT NULL
 );
+
+-- M8 修订：更正单（一条外部变更更正一行，correction_id 唯一保证幂等）
+CREATE TABLE IF NOT EXISTS corrections (
+    run_id TEXT NOT NULL,
+    correction_id TEXT NOT NULL,
+    sub_id TEXT NOT NULL,
+    effective_date TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    new_plan TEXT NOT NULL DEFAULT '',
+    new_price_text TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    payload_digest TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'received',
+    revision_no INTEGER NOT NULL DEFAULT 0,
+    received_at TEXT NOT NULL,
+    published_at TEXT,
+    failure_note TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (run_id, correction_id)
+);
+CREATE INDEX IF NOT EXISTS idx_corrections_run ON corrections(run_id, status);
+
+-- M8 修订：账单版本快照（原账单不可变，每次发布前把整版快照一行版本）
+CREATE TABLE IF NOT EXISTS invoice_versions (
+    run_id TEXT NOT NULL,
+    revision_no INTEGER NOT NULL,
+    invoice_id TEXT NOT NULL,
+    sub_id TEXT NOT NULL,
+    account TEXT NOT NULL DEFAULT '',
+    period_start TEXT NOT NULL,
+    period_end TEXT NOT NULL,
+    period_days INTEGER NOT NULL,
+    billed_days INTEGER NOT NULL,
+    free_days INTEGER NOT NULL,
+    charge_cents INTEGER NOT NULL,
+    credit_cents INTEGER NOT NULL,
+    total_cents INTEGER NOT NULL,
+    exact_total TEXT NOT NULL DEFAULT '0',
+    status TEXT NOT NULL DEFAULT 'ok',
+    flags_json TEXT NOT NULL DEFAULT '[]',
+    row_hash TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (run_id, revision_no, invoice_id)
+);
+
+-- M8 修订：调整单（逐张账单 原额→新额→差额，挂更正号与版本号）
+CREATE TABLE IF NOT EXISTS revision_adjustments (
+    run_id TEXT NOT NULL,
+    revision_no INTEGER NOT NULL,
+    correction_id TEXT NOT NULL,
+    invoice_id TEXT NOT NULL,
+    sub_id TEXT NOT NULL,
+    account TEXT NOT NULL DEFAULT '',
+    before_cents INTEGER NOT NULL,
+    after_cents INTEGER NOT NULL,
+    delta_cents INTEGER NOT NULL,
+    direction TEXT NOT NULL DEFAULT 'unchanged',
+    note TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (run_id, revision_no, invoice_id, correction_id)
+);
+CREATE INDEX IF NOT EXISTS idx_adjust_revision
+    ON revision_adjustments(run_id, revision_no);
 """
 
 
@@ -550,6 +612,234 @@ class Store:
             row = conn.execute(
                 "SELECT json FROM manifests WHERE run_id=?", (run_id,)).fetchone()
         return _loads(row["json"], {}) if row else None
+
+    # ---------- M8 更正单 ----------
+    def insert_correction(self, item: dict) -> None:
+        """登记更正单；correction_id 冲突交给调用方先查，不在此静默覆盖。"""
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO corrections (run_id, correction_id, sub_id, effective_date,
+                        kind, new_plan, new_price_text, reason, source, payload_json,
+                        payload_digest, status, revision_no, received_at, published_at,
+                        failure_note)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (item["run_id"], item["correction_id"], item["sub_id"],
+                 item["effective_date"], item["kind"], item.get("new_plan", ""),
+                 item.get("new_price_text", ""), item.get("reason", ""),
+                 item.get("source", ""),
+                 json.dumps(item.get("payload", {}), ensure_ascii=False),
+                 item.get("payload_digest", ""), item.get("status", "received"),
+                 int(item.get("revision_no", 0)), item["received_at"],
+                 item.get("published_at"), item.get("failure_note", "")),
+            )
+
+    def get_correction(self, run_id: str, correction_id: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM corrections WHERE run_id=? AND correction_id=?",
+                (run_id, correction_id)).fetchone()
+        return self._correction_row(row) if row else None
+
+    def list_corrections(self, run_id: str) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM corrections WHERE run_id=? "
+                "ORDER BY received_at, rowid", (run_id,)).fetchall()
+        return [self._correction_row(row) for row in rows]
+
+    @staticmethod
+    def _correction_row(row: sqlite3.Row) -> dict:
+        data = dict(row)
+        data["payload"] = _loads(data.pop("payload_json", "{}"), {})
+        return data
+
+    def mark_correction(self, run_id: str, correction_id: str, *, status: str,
+                        revision_no: int | None = None, published_at: str | None = None,
+                        failure_note: str | None = None) -> None:
+        sets = ["status=?"]
+        values: list = [status]
+        if revision_no is not None:
+            sets.append("revision_no=?")
+            values.append(int(revision_no))
+        if published_at is not None:
+            sets.append("published_at=?")
+            values.append(published_at)
+        if failure_note is not None:
+            sets.append("failure_note=?")
+            values.append(failure_note)
+        values.extend([run_id, correction_id])
+        with self.connect() as conn:
+            conn.execute(
+                f"UPDATE corrections SET {', '.join(sets)} "
+                "WHERE run_id=? AND correction_id=?", values)
+
+    # ---------- M8 账单版本快照 ----------
+    def latest_revision_no(self, run_id: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(revision_no), 0) AS n FROM invoice_versions "
+                "WHERE run_id=?", (run_id,)).fetchone()
+        return int(row["n"])
+
+    def list_invoice_versions(self, run_id: str,
+                              revision_no: int | None = None) -> list[dict]:
+        with self.connect() as conn:
+            if revision_no is None:
+                rows = conn.execute(
+                    "SELECT * FROM invoice_versions WHERE run_id=? "
+                    "ORDER BY revision_no, invoice_id", (run_id,)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM invoice_versions WHERE run_id=? AND revision_no=? "
+                    "ORDER BY invoice_id", (run_id, revision_no)).fetchall()
+        out = []
+        for row in rows:
+            data = dict(row)
+            data["flags"] = _loads(data.pop("flags_json", "[]"), [])
+            out.append(data)
+        return out
+
+    # ---------- M8 调整单 ----------
+    def list_adjustments(self, run_id: str,
+                         revision_no: int | None = None) -> list[dict]:
+        with self.connect() as conn:
+            if revision_no is None:
+                rows = conn.execute(
+                    "SELECT * FROM revision_adjustments WHERE run_id=? "
+                    "ORDER BY revision_no, invoice_id, correction_id",
+                    (run_id,)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM revision_adjustments WHERE run_id=? AND revision_no=? "
+                    "ORDER BY invoice_id, correction_id",
+                    (run_id, int(revision_no))).fetchall()
+        return [dict(row) for row in rows]
+
+    # ---------- M8 原子发布 ----------
+    @contextmanager
+    def transaction(self):
+        """单连接事务：正常退出提交，异常整体回滚（修订发布失败必须恢复完整旧版）。"""
+        conn = sqlite3.connect(self.path, timeout=15.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def publish_revision(self, run_id: str, revision_no: int, *, snapshot: list[dict],
+                         hashes: dict[str, str], changes: list[dict],
+                         segments: list[dict], components: list[dict],
+                         invoices: list[dict], adjustments: list[dict],
+                         ledgers: list[dict], totals: dict,
+                         stages: list[dict]) -> None:
+        """修订发布在一个事务内完成：先存旧版快照，再整版替换变更与派生表，失败整体回滚。"""
+        with self.transaction() as conn:
+            conn.executemany(
+                """INSERT INTO invoice_versions (run_id, revision_no, invoice_id, sub_id,
+                        account, period_start, period_end, period_days, billed_days,
+                        free_days, charge_cents, credit_cents, total_cents, exact_total,
+                        status, flags_json, row_hash)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [(run_id, int(revision_no), item["invoice_id"], item["sub_id"],
+                  item.get("account", ""), item["period_start"], item["period_end"],
+                  int(item["period_days"]), int(item["billed_days"]),
+                  int(item["free_days"]), int(item["charge_cents"]),
+                  int(item["credit_cents"]), int(item["total_cents"]),
+                  str(item.get("exact_total", "0")), item.get("status", "ok"),
+                  json.dumps(item.get("flags", []), ensure_ascii=False),
+                  hashes.get(item["invoice_id"], "")) for item in snapshot],
+            )
+            # 合并后的变更序列落库：后续修订必须在「上一版事实」之上继续并入
+            conn.execute("DELETE FROM changes WHERE run_id=?", (run_id,))
+            conn.executemany(
+                """INSERT INTO changes (run_id, seq, change_id, sub_id, effective_utc,
+                        effective_local, local_date, kind, new_plan, new_price_text,
+                        new_price, source_file, row_no, applied, superseded_by,
+                        flags_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [(run_id, int(item["seq"]), item["change_id"], item["sub_id"],
+                  item["effective_utc"], item["effective_local"], item["local_date"],
+                  item["kind"], item.get("new_plan", ""),
+                  item.get("new_price_text", ""), str(item.get("new_price", "")),
+                  item.get("source_file", ""), int(item.get("row_no", 0)),
+                  int(item.get("applied", 1)), item.get("superseded_by", ""),
+                  json.dumps(item.get("flags", []), ensure_ascii=False))
+                 for item in changes],
+            )
+            for table in ("segments", "components", "invoices", "reconciliations",
+                          "totals", "stages"):
+                conn.execute(f"DELETE FROM {table} WHERE run_id=?", (run_id,))
+            conn.executemany(
+                """INSERT INTO segments (run_id, invoice_id, sub_id, seq, start_date,
+                        end_date, days, plan, state, monthly, amount_exact, amount_cents,
+                        flags_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [(run_id, item["invoice_id"], item["sub_id"], int(item["seq"]),
+                  item["start_date"], item["end_date"], int(item["days"]), item["plan"],
+                  item["state"], str(item.get("monthly", "")),
+                  str(item.get("amount_exact", "0")), int(item.get("amount_cents", 0)),
+                  json.dumps(item.get("flags", []), ensure_ascii=False))
+                 for item in segments],
+            )
+            conn.executemany(
+                """INSERT INTO components (run_id, invoice_id, sub_id, seq, kind, source,
+                        label, days, monthly, exact_text, cents, flags_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [(run_id, item["invoice_id"], item["sub_id"], int(item["seq"]),
+                  item["kind"], item.get("source", ""), item.get("label", ""),
+                  int(item.get("days", 0)), str(item.get("monthly", "")),
+                  str(item["exact"]), int(item["cents"]),
+                  json.dumps(item.get("flags", []), ensure_ascii=False))
+                 for item in components],
+            )
+            conn.executemany(
+                """INSERT INTO invoices (run_id, invoice_id, sub_id, account, period_start,
+                        period_end, period_days, billed_days, free_days, charge_cents,
+                        credit_cents, total_cents, exact_total, status, flags_json,
+                        source_row)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [(run_id, item["invoice_id"], item["sub_id"], item.get("account", ""),
+                  item["period_start"], item["period_end"], int(item["period_days"]),
+                  int(item["billed_days"]), int(item["free_days"]),
+                  int(item["charge_cents"]), int(item["credit_cents"]),
+                  int(item["total_cents"]), str(item.get("exact_total", "0")),
+                  item.get("status", "ok"),
+                  json.dumps(item.get("flags", []), ensure_ascii=False),
+                  int(item.get("source_row", 0))) for item in invoices],
+            )
+            conn.executemany(
+                """INSERT INTO reconciliations (run_id, seq, ledger, label, left_text,
+                        right_text, diff_text, status, note)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                [(run_id, int(item["seq"]), item["ledger"], item["label"],
+                  item["left_text"], item["right_text"], item["diff_text"],
+                  item["status"], item.get("note", "")) for item in ledgers],
+            )
+            conn.executemany(
+                "INSERT INTO totals (run_id, key, value) VALUES (?,?,?)",
+                [(run_id, key, str(value)) for key, value in sorted(totals.items())],
+            )
+            conn.executemany(
+                """INSERT INTO stages (run_id, stage, in_count, out_count,
+                        quarantine_count, status, note) VALUES (?,?,?,?,?,?,?)""",
+                [(run_id, item["stage"], int(item["in_count"]), int(item["out_count"]),
+                  int(item["quarantine_count"]), item.get("status", "done"),
+                  item.get("note", "")) for item in stages],
+            )
+            conn.executemany(
+                """INSERT INTO revision_adjustments (run_id, revision_no, correction_id,
+                        invoice_id, sub_id, account, before_cents, after_cents,
+                        delta_cents, direction, note)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                [(run_id, int(revision_no), item["correction_id"], item["invoice_id"],
+                  item["sub_id"], item.get("account", ""), int(item["before_cents"]),
+                  int(item["after_cents"]), int(item["delta_cents"]),
+                  item["direction"], item.get("note", "")) for item in adjustments],
+            )
 
     # ---------- 整体重算 ----------
     def clear_derived(self, run_id: str) -> None:

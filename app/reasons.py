@@ -49,6 +49,11 @@ REASONS: dict[str, tuple[str, str]] = {
     "R_DUP_INVOICE": ("error", "同一订阅同一期间出现两张账单"),
     "R_INVOICE_ZERO": ("info", "账单金额为零"),
     "R_ROUND_ADJUST": ("info", "尾差按最大余额分配到分"),
+    # ---- M8 账单修订 ----
+    "R_REVISION_LATE": ("warn", "更正于账单发出后到达，按修订流程处理"),
+    "R_REVISION_CORRECTION": ("warn", "更正变更参与修订重算"),
+    "R_REVISION_REFUND": ("info", "修订产生应退差额"),
+    "R_REVISION_SURCHARGE": ("info", "修订产生应补差额"),
 }
 
 LEVEL_LABELS = {"error": "隔离", "warn": "复核", "info": "归一"}

@@ -97,6 +97,7 @@ STAGE_LABELS = {
     "changes": "变更",
     "proration": "折算",
     "invoices": "账单",
+    "revision": "修订",
 }
 STAGE_FLOW = "采信 → 期间 → 质量 → 变更 → 折算 → 账单"
 

@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block title %}账单修订{% endblock %}
+{% block body %}
+<section class="block">
+  <div class="block-head">
+    <h2>修订状态</h2>
+    <span class="sub">当前修订版 R{{ current_revision }} · 原账单按版本快照留档，不覆盖</span>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th class="num">更正单数</th>
+          <th class="num">受影响账单</th>
+          <th class="num">应退合计(元)</th>
+          <th class="num">应补合计(元)</th>
+          <th class="num">净差额(元)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="num">{{ revision_totals.get("revision_count", 0) }}</td>
+          <td class="num">{{ revision_totals.get("affected_invoices", 0) }}</td>
+          <td class="num">{{ revision_totals.get("refund_cents", 0)|money }}</td>
+          <td class="num">{{ revision_totals.get("surcharge_cents", 0)|money }}</td>
+          <td class="num">{{ revision_totals.get("net_delta_cents", 0)|money }}</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="sub" style="margin-top:8px">
+    登记接口 <code>POST /api/revisions/corrections</code> ·
+    发布接口 <code>POST /api/revisions/publish</code> ·
+    调整单 <a href="/api/revisions/adjustments.csv">CSV</a>
+  </p>
+</section>
+
+<section class="block">
+  <div class="block-head">
+    <h2>更正单</h2>
+    <span class="sub">同一更正号重发/重试不重复产生调整（幂等键：更正号）</span>
+  </div>
+  {% if corrections %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>更正号</th>
+          <th>订阅号</th>
+          <th>账户</th>
+          <th>生效日</th>
+          <th>类型</th>
+          <th>修订版</th>
+          <th>状态</th>
+          <th>依据/失败原因</th>
+          <th>入参哈希</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in corrections %}
+        <tr>
+          <td><code>{{ row.correction_id }}</code></td>
+          <td><code>{{ row.sub_id }}</code></td>
+          <td class="account" title="{{ row.account }}">{{ row.account or "—" }}</td>
+          <td><code>{{ row.effective_date }}</code></td>
+          <td>{{ row.kind_label }}</td>
+          <td class="num">{% if row.revision_no %}R{{ row.revision_no }}{% else %}—{% endif %}</td>
+          <td class="nowrap">
+            {% if row.status == "published" %}<span class="tag tag-ok">已发布</span>
+            {% elif row.status == "failed" %}<span class="tag tag-bad">失败</span>
+            {% else %}<span class="tag tag-warn">待发布</span>{% endif %}
+          </td>
+          <td><code>{{ row.failure_note or row.reason or "—" }}</code></td>
+          <td><code>{{ row.payload_digest|sha }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">还没有更正单。账已发出后到达的变更更正从这里登记，再发布修订版。</p>
+  {% endif %}
+</section>
+
+<section class="block">
+  <div class="block-head">
+    <h2>调整单</h2>
+    <span class="sub">原账单额 → 修订后金额，正补负退；逐张满足 原额 + 差额 = 新额</span>
+  </div>
+  {% if adjustments %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>修订版</th>
+          <th>账单号</th>
+          <th>账户</th>
+          <th class="num">原账单额(元)</th>
+          <th class="num">修订后(元)</th>
+          <th class="num">差额(元)</th>
+          <th>方向</th>
+          <th>更正号</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in adjustments %}
+        <tr>
+          <td>R{{ row.revision_no }}</td>
+          <td><code>{{ row.invoice_id }}</code></td>
+          <td class="account" title="{{ row.account }}">{{ row.account }}</td>
+          <td class="num">{{ row.before }}</td>
+          <td class="num">{{ row.after }}</td>
+          <td class="num">
+            {% if row.delta_cents < 0 %}-{% endif %}{{ row.delta }}
+          </td>
+          <td class="nowrap">
+            {% if row.direction == "refund" %}<span class="tag tag-warn">{{ row.direction_label }}</span>
+            {% elif row.direction == "surcharge" %}<span class="tag tag-ok">{{ row.direction_label }}</span>
+            {% else %}<span class="tag">{{ row.direction_label }}</span>{% endif %}
+          </td>
+          <td><code>{{ row.correction_id }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">发布修订后，这里逐张列出受影响账单与应退/应补金额。</p>
+  {% endif %}
+</section>
+
+<section class="block">
+  <div class="block-head">
+    <h2>账单版本快照</h2>
+    <span class="sub">每次发布前整版快照，含全字段哈希，旧版可逐字取回</span>
+  </div>
+  {% if versions %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>版本</th>
+          <th>账单号</th>
+          <th class="num">账单额(分)</th>
+          <th>全字段哈希</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in versions %}
+        <tr>
+          <td>R{{ row.revision_no }}</td>
+          <td><code>{{ row.invoice_id }}</code></td>
+          <td class="num">{{ row.total_cents }}</td>
+          <td><code>{{ row.row_hash|sha(16) }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">还没有版本快照（首次修订发布时生成）。</p>
+  {% endif %}
+</section>
+{% endblock %}

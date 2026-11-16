@@ -11,7 +11,8 @@
 - 按日折算：日价 = 月价 ÷ 期间实际天数，全程 Decimal，只在记账时量化到分。
 - 变更抵扣：预缴整期，变更日抵扣旧套餐未用额度并按新价补收剩余天数。
 - 账单对账：行数账 / 期间天数账 / 金额账 / 出账账四本账，差异逐条说明。
-- 导出：账单 CSV、分段 CSV（含原值与标记）、运行清单 JSON（run_id + 输入 sha256 + 校验位）。
+- 账单修订：发账后到达的账期内更正不覆盖原账单，按版本快照 + 调整单发布，修订账守恒、幂等、失败整体回滚。
+- 导出：账单 CSV、分段 CSV（含原值与标记）、调整单 CSV、运行清单 JSON（run_id + 输入 sha256 + 校验位）。
 
 ## 核心规则
 
@@ -38,17 +39,19 @@
 | M5 变更抵扣 | 变更序列、替代关系、抵扣行 | `GET /api/changes` |
 | M6 账单对账 | 出账、账单明细、四本账 | `GET /api/invoices` |
 | M7 导出 | 账单 CSV、分段 CSV、清单 JSON | `GET /api/export/invoices.csv` |
+| M8 账单修订 | 更正登记、修订发布、调整单与版本快照 | `POST /api/revisions/publish` |
 
 ## 页面
 
 | 路径 | 内容 |
 |---|---|
-| `/` | 批次清单、采信入口、阶段计数、四本账 |
+| `/` | 批次清单、采信入口、阶段计数、五本账 |
 | `/subscriptions` | 输入摘要、列契约、订阅清单、隔离区 |
 | `/calendar` | 期间日历与天数核算 |
 | `/proration` | 分段折算与日价 |
 | `/changes` | 变更序列与抵扣行 |
 | `/invoices` | 账单、对账、导出入口、点行看明细 |
+| `/revisions` | 更正单、调整单（应退/应补）、账单版本快照 |
 
 ## 启动
 
@@ -66,6 +69,7 @@ docker compose up -d --build
 3. 期间日历页切换 2028-02 起点日期，核算出 29 天。
 4. 折算页看日价与分段金额；变更页看被替代的变更与抵扣行。
 5. 账单页点任意账单行看分段与抵扣行明细；底部导出账单 CSV、分段 CSV、清单 JSON。
+6. 账单修订页（或 `POST /api/revisions/corrections` 后 `POST /api/revisions/publish`）登记一条账期内更正：原账单进版本快照，调整单列出应退/应补，对账新增修订账且五本账全平；重复发布同一更正号不产生第二笔调整。
 
 ## 定义与已知不覆盖
 
@@ -78,12 +82,13 @@ docker compose up -d --build
 ```text
 app/
   main.py config.py errors.py reasons.py manifest.py store.py web.py
-  modules/m1_ingest … m7_export/   handler.py service.py + 2 个规则/读写文件
-  templates/  base + 6 页
+  modules/m1_ingest … m8_revisions/   handler.py service.py + 规则/读写文件
+  templates/  base + 7 页
   static/     theme.css layout.css components.css app.js table.js invoices.js
 docs/         DEPTH.md DATA-DICTIONARY.md RUNBOOK.md
 sample_data/  7 个脏样例（含 GB18030、截断、空态）
-tests/        conftest + 每模块 2 个测试文件 + e2e + invariants + fixtures
+tests/        conftest + 每模块测试 + e2e + invariants + fixtures
+```
 ```
 
 ## 测试

@@ -73,3 +73,17 @@
 - `run_id`：`SB-<本地时间戳>-<4 位随机>`，右侧两位 `check_digit` 为 mod-97 校验位。
 - `batch_key`：规则版本 + 两份输入 sha256 的摘要；同 key 重跑复用同一批次。
 - 清单记录：输入文件名、字节数、编码、行数、sha256、参数、阶段计数、四本账结论、合计、耗时。
+
+## M8 账单修订（账已发出后的变更更正）
+
+账单发出后才收到、生效日落在账期内的变更更正，**不覆盖原账单**，走「版本快照 + 调整单」：
+
+- 原账单不可变：每次发布修订前，把整版账单逐张快照进 `invoice_versions`（含全字段哈希 `row_hash`），旧版可逐字取回。
+- 更正单 `corrections`：业务键 `(run_id, correction_id)` 唯一；记录依据 `reason`、来源 `source`、生效日、入参哈希 `payload_digest` 与状态（`received/published/failed`）。
+- 调整单 `revision_adjustments`：逐张账单记 `before_cents / after_cents / delta_cents`，恒等式 `before + delta = after`；`delta > 0` 应补（`surcharge`），`delta < 0` 应退（`refund`），为 0 记 `unchanged`。
+- 修订版号 `revision_no` 从 1 单调递增；合并后的变更序列随发布事务落库，后续修订在上一版事实之上继续并入（链式不丢历史更正）。
+- 第五本账「修订账」：`Σ调整差额 == Σ当前账单额 − Σ原账单额`，单位分，差为 0 才平。
+- 幂等：同 `correction_id` 重发/重试直接返回已发布修订，不重复产生调整、不新增版本快照。
+- 原子发布：快照、变更/分段/抵扣/账单整版替换、调整单、对账、阶段在一个 SQLite 事务内；失败整体回滚，旧版派生表逐行保留，更正单标 `failed` 并留失败原因，可重试。
+- 修订相关原因码：`R_REVISION_LATE`（更正于发账后到达）、`R_REVISION_CORRECTION`（更正参与重算）、`R_REVISION_REFUND`、`R_REVISION_SURCHARGE`。
+- 清单 JSON 追加 `revisions` 数组与 `current_revision`；调整单可导出 `GET /api/revisions/adjustments.csv`，与账单 CSV、分段 CSV、清单读同一批表。

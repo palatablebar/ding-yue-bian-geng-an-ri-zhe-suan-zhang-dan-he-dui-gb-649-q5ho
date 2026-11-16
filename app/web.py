@@ -26,6 +26,7 @@ NAV = (
     ("/proration", "按日折算", "proration"),
     ("/changes", "变更抵扣", "changes"),
     ("/invoices", "账单对账", "invoices"),
+    ("/revisions", "账单修订", "revisions"),
 )
 
 
